@@ -14,7 +14,7 @@ This MVP includes:
 - Pull analysis.py restructure.py ui.py
 - Run restructure-emoji.py --> prompts for JSON selection --> select raw JSON file from desktop --> saves structured JSON on desktop
 - Run [streamlit run ui.py] --> opens streamlit ui --> upload structured JSON file --> click Run Narrative Analysis (takes a few minutes)
-- View results --> results are downloadable / saved in root directory data/fb_comments
+- View results --> results are downloadable / saved in root directory data/sm_comments
 
 ---
 
@@ -27,7 +27,7 @@ Example raw item:
 
 ```json
 {
-  "id": "1913950356145953","typename": "FB_COMMENT","text": "Na cruise we come catch for this country I swear 😂😂😂" .. ... ..... .......
+  "id": "1913950356145953","typename": "SM_COMMENT","text": "I like turtles" .. ... ..... .......
 }
 ```
 
@@ -47,10 +47,10 @@ project_root/
 │
 ├── restructure-emoji.py          # Data normalization tool
 │
-├── qwen2.5_7b/                   # Local Qwen2.5-7B-Instruct model folder
+├── # USE LOCAL LLM OR API KEY
 │
 ├── data/
-│   └── fb_comments.json    # Output from restructure script
+│   └── social-media-comments.json    # NEED a "text" field
 │
 └── README.md
 ```
@@ -157,15 +157,3 @@ Install dependencies:
 ```bash
 pip install streamlit transformers accelerate torch pydantic
 ```
-
-Also ensure you have the Qwen model downloaded:
-
-```
-qwen2.5_7b/
-```
-
----
-# 👑 Repo POC 
-
-* Repo Owner: Melissa Vixama
-* Team: AF-ST
