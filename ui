@@ -1,0 +1,203 @@
+import json
+from typing import List, Set
+
+import streamlit as st
+
+from core.analysis import run_narrative_analysis, AnalysisResult, AnalysisError
+
+
+st.set_page_config(
+    page_title="Narrative Analysis MVP",
+    layout="wide",
+)
+
+st.title("📊 Narrative Analysis MVP")
+st.write(
+    "Upload Facebook comments or paste them below. The app will extract an overall summary, "
+    "dominant narratives, and a few example comments using your local Qwen2.5-7B model."
+)
+
+st.markdown("---")
+
+
+# =========================
+# Helper: extract comments from arbitrary JSON
+# =========================
+def extract_comments_from_json(data) -> List[str]:
+    """
+    Extract comment text from arbitrary JSON.
+
+    Supports:
+    - List of strings
+    - List of dicts with "text" or attributes.text
+    - Arbitrary nested dict/list structures
+    """
+    comments: List[str] = []
+    seen: Set[str] = set()
+
+    # Case: list of strings directly
+    if isinstance(data, list) and all(isinstance(x, str) for x in data):
+        for x in data:
+            cleaned = x.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                comments.append(cleaned)
+        return comments
+
+    def recurse(node):
+        if isinstance(node, dict):
+            # primary "text"
+            txt = None
+            if isinstance(node.get("text"), str):
+                txt = node["text"]
+            # fallback attributes.text
+            elif isinstance(node.get("attributes"), dict) and isinstance(
+                node["attributes"].get("text"), str
+            ):
+                txt = node["attributes"]["text"]
+
+            if txt:
+                cleaned = txt.strip()
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    comments.append(cleaned)
+
+            # Recurse into all values
+            for v in node.values():
+                recurse(v)
+
+        elif isinstance(node, list):
+            for item in node:
+                recurse(item)
+
+        # we ignore bare strings here in nested structures to avoid picking up
+        # random labels or keys; only list-of-strings at top-level is treated as comments
+
+    recurse(data)
+    return comments
+
+
+# =========================
+# Input mode selector
+# =========================
+mode = st.radio(
+    "How do you want to provide comments?",
+    options=["Paste text (one comment per line)", "Upload JSON file"],
+    horizontal=True,
+)
+
+comments: List[str] = []
+
+# =========================
+# Mode 1: Paste comments
+# =========================
+if mode == "Paste text (one comment per line)":
+    text_input = st.text_area(
+        "Comments",
+        height=250,
+        placeholder="Paste comments here, one per line...",
+    )
+    if text_input.strip():
+        comments = [line.strip() for line in text_input.splitlines() if line.strip()]
+
+# =========================
+# Mode 2: Upload JSON file
+# =========================
+else:
+    uploaded_file = st.file_uploader("Upload JSON file with comments", type=["json"])
+    if uploaded_file is not None:
+        try:
+            data = json.load(uploaded_file)
+
+            comments = extract_comments_from_json(data)
+
+            if comments:
+                st.success(f"✅ Extracted {len(comments)} comments from the JSON file.")
+                with st.expander("Preview of extracted comments (first 10)"):
+                    for c in comments[:10]:
+                        st.markdown(f"- {c}")
+            else:
+                st.warning(
+                    "No comments found. The JSON must contain at least one object with a 'text' "
+                    "field (or attributes.text), or be a list of strings."
+                )
+
+        except Exception as e:
+            st.error(f"Failed to parse JSON file: {e}")
+
+st.markdown("---")
+
+# =========================
+# Run button
+# =========================
+run_button = st.button(
+    "🚀 Run Narrative Analysis",
+    type="primary",
+    disabled=not comments,
+)
+
+if run_button:
+    if not comments:
+        st.error("Please provide at least one comment.")
+    else:
+        with st.spinner(f"Analyzing {len(comments)} comments..."):
+            result = run_narrative_analysis(comments)
+
+        # =========================
+        # Error case
+        # =========================
+        if isinstance(result, AnalysisError):
+            st.error("Analysis failed.")
+            st.write("**Error message:**")
+            st.code(result.error_message)
+            if result.raw_output:
+                with st.expander("Raw model output (truncated)"):
+                    st.code(result.raw_output)
+
+        # =========================
+        # Success case
+        # =========================
+        elif isinstance(result, AnalysisResult):
+            st.success("Analysis complete ✅")
+
+            # Overall summary
+            st.subheader("🧩 Overall Summary")
+            st.write(result.overall_summary)
+
+            # Dominant narratives
+            st.subheader("📚 Dominant Narratives")
+            if result.dominant_narratives:
+                for i, title in enumerate(result.dominant_narratives, start=1):
+                    st.markdown(f"**{i}. {title}**")
+            else:
+                st.write("_No narratives returned._")
+
+            # Example comments
+            st.subheader("💬 Example Comments")
+            if result.example_comments:
+                for c in result.example_comments:
+                    st.markdown(f"- {c}")
+            else:
+                st.write("_No example comments returned._")
+
+            # Raw JSON + Download
+            st.markdown("---")
+            st.subheader("🧾 Raw JSON Output")
+
+            final_json = {
+                "overall_summary": result.overall_summary,
+                "dominant_narratives": result.dominant_narratives,
+                "example_comments": result.example_comments,
+            }
+            json_str = json.dumps(final_json, ensure_ascii=False, indent=2)
+            st.code(json_str, language="json")
+
+            st.download_button(
+                label="⬇️ Download JSON",
+                data=json_str.encode("utf-8"),
+                file_name="narrative_analysis.json",
+                mime="application/json",
+            )
+
+        else:
+            st.error("Unexpected result type from analysis backend.")

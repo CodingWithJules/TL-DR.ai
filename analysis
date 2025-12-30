@@ -1,0 +1,333 @@
+from typing import List, Union
+from pydantic import BaseModel
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+import json
+import torch
+import re
+
+MODEL_PATH = "qwen2.5_7b"   # local dir for Qwen/Qwen2.5-7B-Instruct
+MAX_NEW_TOKENS = 512
+CHUNK_SIZE = 150
+
+
+# ===============================
+# Pydantic models for API
+# ===============================
+class AnalysisResult(BaseModel):
+    overall_summary: str
+    dominant_narratives: List[str]
+    example_comments: List[str]
+
+
+class AnalysisError(BaseModel):
+    error_message: str
+    raw_output: str = ""
+
+
+# ===============================
+# Global model / pipeline cache
+# ===============================
+_pipe = None
+_tokenizer = None
+
+
+def get_pipeline_and_tokenizer():
+    global _pipe, _tokenizer
+    if _pipe is not None and _tokenizer is not None:
+        return _pipe, _tokenizer
+
+    print("[INFO] Loading Qwen2.5-7B-Instruct model (first time)...")
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+    if torch.cuda.is_available():
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_PATH,
+            dtype=torch.bfloat16,
+            device_map={"": 0},  # all on GPU 0 via accelerate
+        )
+        _pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=_tokenizer,
+            # no device= here; accelerate already owns placement
+        )
+    else:
+        print("[WARN] CUDA not available. Running on CPU.")
+        model = AutoModelForCausalLM.from_pretrained(MODEL_PATH)
+        _pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=_tokenizer,
+            device=-1,
+        )
+
+    return _pipe, _tokenizer
+
+
+# ===============================
+# Helpers
+# ===============================
+def chunk_list(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def extract_json(text: str) -> str:
+    """Grab the last JSON-looking block in the text."""
+    matches = re.findall(r"\{.*\}", text, flags=re.DOTALL)
+    if not matches:
+        return text
+    return matches[-1]
+
+
+def normalize_final_json(final_json_str: str,
+                         max_narratives: int = 6,
+                         max_examples: int = 5) -> str:
+    """
+    Clamp:
+      - dominant_narratives length to <= max_narratives
+      - example_comments length to <= max_examples
+    """
+    try:
+        data = json.loads(final_json_str)
+    except json.JSONDecodeError:
+        print("[WARN] Could not parse final JSON; returning raw string.")
+        return final_json_str
+
+    narratives = data.get("dominant_narratives", [])
+    if isinstance(narratives, list) and len(narratives) > max_narratives:
+        narratives = narratives[:max_narratives]
+        data["dominant_narratives"] = narratives
+
+    examples = data.get("example_comments", [])
+    if isinstance(examples, list) and len(examples) > max_examples:
+        examples = examples[:max_examples]
+        data["example_comments"] = examples
+
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+# ===============================
+# Prompt builders
+# ===============================
+def build_chunk_messages(comments: List[str]):
+    """
+    For each chunk:
+    - overall_summary: 1–3 sentences
+    - dominant_narratives: 3–6 short descriptive phrases
+    - example_comments: 2–5 representative comments (global)
+    """
+    system_msg = (
+        "You are an expert narrative analyst. You analyze Facebook comments and extract themes.\n\n"
+        "For this subset of comments, your tasks are:\n"
+        "1. overall_summary: 1–3 sentences describing what people are mainly talking about in this subset.\n"
+        "2. dominant_narratives: 3–6 short descriptive phrases capturing the main recurring themes in the comments.\n"
+        "   - Each title should be a short phrase (e.g., 'Frustration with Tinubu’s foreign focus', "
+        "     'Anger over insecurity and terrorism at home'). Avoid long sentences.\n"
+        "3. example_comments: 2–5 example comments that best illustrate these themes overall. "
+        "   - Copy the comments verbatim.\n\n"
+        "Return ONLY a single JSON object with this structure:\n"
+        "{\n"
+        '  \"overall_summary\": \"...\",\n'
+        '  \"dominant_narratives\": [\n'
+        '    \"short descriptive phrase 1\",\n'
+        '    \"short descriptive phrase 2\"\n'
+        "  ],\n"
+        '  \"example_comments\": [\n'
+        '    \"comment 1\",\n'
+        '    \"comment 2\"\n'
+        "  ]\n"
+        "}\n\n"
+        "Do not include any explanation or text before or after the JSON. "
+        "Focus on realistic, comment-grounded narratives and keep titles concise."
+    )
+
+    cleaned = [c.replace("\n", " ") for c in comments]
+    joined = "\n".join(f"- {c}" for c in cleaned)
+
+    user_content = f"""Here is a batch of Facebook comments. Analyze only these comments and return ONLY the JSON object, as instructed.
+
+Comments:
+{joined}
+"""
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_content},
+    ]
+    return messages
+
+
+def build_merge_messages(chunk_json_strings: List[str]):
+    """
+    Merge per-chunk JSONs into one final JSON:
+    {
+      "overall_summary": "...",
+      "dominant_narratives": [...],
+      "example_comments": [...]
+    }
+    """
+    system_msg = (
+        "You are an expert narrative analyst. You will be given multiple JSON objects, "
+        "each describing narratives extracted from a subset of Facebook comments.\n\n"
+        "Each JSON has this structure:\n"
+        "{\n"
+        '  \"overall_summary\": \"...\",\n'
+        '  \"dominant_narratives\": [\"short descriptive phrase\", \"...\"] ,\n'
+        '  \"example_comments\": [\"comment 1\", \"comment 2\"]\n'
+        "}\n\n"
+        "Your task is to MERGE them into ONE coherent JSON object with the SAME structure:\n"
+        "{\n"
+        '  \"overall_summary\": \"...\",\n'
+        '  \"dominant_narratives\": [\"short descriptive phrase\", \"...\"] ,\n'
+        '  \"example_comments\": [\"comment 1\", \"comment 2\"]\n'
+        "}\n\n"
+        "Requirements:\n"
+        "- Produce a single overall_summary that captures the key themes across ALL comments.\n"
+        "- Produce BETWEEN 3 and 6 dominant_narratives total.\n"
+        "- Merge similar narratives from different chunks into broader, clearer themes.\n"
+        "- Avoid duplicate or overly similar titles.\n"
+        "- Titles must be short descriptive phrases, not long sentences.\n"
+        "- For example_comments, pick 2–5 of the strongest, most representative comments overall, "
+        "  copied verbatim.\n\n"
+        "Return ONLY the final merged JSON object, with no explanations or extra text."
+    )
+
+    user_content = "Here are the partial JSON analyses for different chunks of comments:\n\n"
+    for i, js in enumerate(chunk_json_strings, start=1):
+        user_content += f"Chunk {i} JSON:\n{js}\n\n"
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_content},
+    ]
+    return messages
+
+
+# ===============================
+# Core runner
+# ===============================
+def run_narrative_analysis(comments: List[str]) -> Union[AnalysisResult, AnalysisError]:
+    """
+    Main entrypoint for the API.
+    Accepts a list of comment strings.
+    Returns AnalysisResult on success, AnalysisError on failure.
+    """
+    if not comments:
+        return AnalysisError(
+            error_message="No comments provided.",
+            raw_output="",
+        )
+
+    pipe, tokenizer = get_pipeline_and_tokenizer()
+
+    # 1) Per-chunk analysis
+    chunk_jsons: List[str] = []
+    try:
+        for idx, chunk in enumerate(chunk_list(comments, CHUNK_SIZE), start=1):
+            print(f"[INFO] Processing chunk {idx} with {len(chunk)} comments...")
+
+            messages = build_chunk_messages(chunk)
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            outputs = pipe(
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                return_full_text=False,
+            )
+
+            raw = outputs[0]["generated_text"]
+            chunk_json_str = extract_json(raw)
+            chunk_jsons.append(chunk_json_str)
+
+            print(f"[INFO] Got JSON for chunk {idx}")
+    except Exception as e:
+        return AnalysisError(
+            error_message=f"Error during chunk-level generation: {e}",
+            raw_output="",
+        )
+
+    # 2) Merge step
+    try:
+        print("[INFO] Combining chunk summaries into final narrative JSON...")
+        merge_messages = build_merge_messages(chunk_jsons)
+        merge_prompt = tokenizer.apply_chat_template(
+            merge_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        merge_outputs = pipe(
+            merge_prompt,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            return_full_text=False,
+        )
+
+        merge_raw = merge_outputs[0]["generated_text"]
+        final_json_str = extract_json(merge_raw)
+        final_json_str = normalize_final_json(final_json_str)
+
+    except Exception as e:
+        return AnalysisError(
+            error_message=f"Error during merge-level generation: {e}",
+            raw_output="",
+        )
+
+    # 3) Validate and convert into AnalysisResult
+    try:
+        data = json.loads(final_json_str)
+    except json.JSONDecodeError as e:
+        return AnalysisError(
+            error_message=f"Final JSON could not be parsed: {e}",
+            raw_output=final_json_str[:2000],
+        )
+
+    # basic schema validation
+    if not isinstance(data, dict):
+        return AnalysisError(
+            error_message="Final JSON is not an object.",
+            raw_output=final_json_str[:2000],
+        )
+
+    if "overall_summary" not in data or "dominant_narratives" not in data or "example_comments" not in data:
+        return AnalysisError(
+            error_message="Final JSON missing required keys.",
+            raw_output=final_json_str[:2000],
+        )
+
+    overall_summary = data.get("overall_summary", "")
+    dominant_narratives = data.get("dominant_narratives", [])
+    example_comments = data.get("example_comments", [])
+
+    # Enforce types / shapes
+    if not isinstance(overall_summary, str):
+        return AnalysisError(
+            error_message="overall_summary is not a string.",
+            raw_output=final_json_str[:2000],
+        )
+    if not isinstance(dominant_narratives, list) or not all(
+        isinstance(x, str) for x in dominant_narratives
+    ):
+        return AnalysisError(
+            error_message="dominant_narratives is not a list of strings.",
+            raw_output=final_json_str[:2000],
+        )
+    if not isinstance(example_comments, list) or not all(
+        isinstance(x, str) for x in example_comments
+    ):
+        return AnalysisError(
+            error_message="example_comments is not a list of strings.",
+            raw_output=final_json_str[:2000],
+        )
+
+    return AnalysisResult(
+        overall_summary=overall_summary,
+        dominant_narratives=dominant_narratives,
+        example_comments=example_comments,
+    )

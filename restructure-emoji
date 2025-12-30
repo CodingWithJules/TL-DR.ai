@@ -1,0 +1,87 @@
+import json
+import os
+import tkinter as tk
+from tkinter import filedialog
+
+
+def structure_json_nodes_with_file_dialog():
+    """
+    Opens a system file dialog to select a JSON file.
+    Filters nodes to include only those with 'text', and saves the result
+    with a fixed name ("JSON_Structured_Example.json") to the source directory.
+    """
+
+    # --- STEP 1: PROMPT USER TO SELECT INPUT FILE USING A GUI DIALOG ---
+    # Initialize and immediately hide the root tkinter window
+    root = tk.Tk()
+    root.withdraw()
+
+    # Open the file dialog, filtering for JSON files
+    input_file_name = filedialog.askopenfilename(
+        title="Select JSON File to Process",
+        filetypes=(("JSON files", "*.json"), ("All files", "*.*"))
+    )
+
+    # Check if the user cancelled the dialog
+    if not input_file_name:
+        print("File selection cancelled by the user.")
+        return
+
+    # --- CRITICAL CHANGE FOR OUTPUT PATH ---
+    # 1. Get the directory path of the input file
+    source_directory = os.path.dirname(input_file_name)
+
+    # 2. Define the desired fixed name for the output file
+    new_file_name = "JSON_Structured_Example.json"
+
+    # 3. Combine the directory and the new file name to create the absolute output path
+    output_file_name = os.path.join(source_directory, new_file_name)
+
+    # --- STEP 2: LOAD AND PROCESS DATA ---
+    try:
+        with open(input_file_name, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Input file '{input_file_name}' not found.")
+        return
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from '{input_file_name}'. Ensure it is valid JSON.")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred during loading: {e}")
+        return
+
+    text_nodes_full = []
+
+    if 'nodes' in data and isinstance(data['nodes'], list):
+        for node in data['nodes']:
+            # Check for 'attributes' and 'text'
+            if (isinstance(node, dict) and
+                    'attributes' in node and
+                    isinstance(node['attributes'], dict) and
+                    'text' in node['attributes']):
+                node_data = {}
+                node_data['key'] = node.get('key')
+
+                # Merge all attributes elements
+                node_data.update(node['attributes'])
+
+                text_nodes_full.append(node_data)
+
+    # Structure the final output
+    final_structured_json = {
+        'nodes_with_all_elements_and_text': text_nodes_full
+    }
+
+    # --- STEP 3: SAVE STRUCTURED DATA ---
+    # The file is saved using the absolute path in output_file_name
+    with open(output_file_name, 'w', encoding='utf-8') as f:
+        json.dump(final_structured_json, f, indent=4)
+
+    print(f"\nSuccessfully processed {len(text_nodes_full)} nodes from {os.path.basename(input_file_name)}.")
+    print(f"Structured JSON data saved to: {output_file_name}")
+
+
+# Run the function on your local machine
+if __name__ == "__main__":
+    structure_json_nodes_with_file_dialog()
