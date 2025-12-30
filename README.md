@@ -1,4 +1,4 @@
-# 📊 Narrative Analysis MVP
+# 📊 Narrative Analysis
 A lightweight system for extracting **overall summaries**, **dominant narratives**, and **representative comments** from large batches of Facebook comments using a **local Qwen2.5-7B model**.
 
 This MVP includes:
