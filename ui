@@ -7,13 +7,13 @@ from core.analysis import run_narrative_analysis, AnalysisResult, AnalysisError
 
 
 st.set_page_config(
-    page_title="Narrative Analysis MVP",
+    page_title="Narrative Analysis",
     layout="wide",
 )
 
 st.title("📊 Narrative Analysis MVP")
 st.write(
-    "Upload Facebook comments or paste them below. The app will extract an overall summary, "
+    "Upload social media comments or paste them below. The app will extract an overall summary, "
     "dominant narratives, and a few example comments using your local Qwen2.5-7B model."
 )
 
